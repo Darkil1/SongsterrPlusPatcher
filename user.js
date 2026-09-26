@@ -1,30 +1,24 @@
 // ==UserScript==
-// @name Songsterr Plus Patcher
-// @namespace https://github.com/Strikeless
-// @version 1.4.1
-// @description Trick Songsterr to unlock plus features.
-// @license MIT
-// @supportURL https://github.com/Strikeless/SongsterrPlusPatcher
-// @match http*://*.songsterr.com/*
-// @run-at document-start
-// @grant unsafeWindow
-// @grant GM.xmlHttpRequest
+// @name         Songsterr Plus Patcher
+// @namespace    https://github.com/Strikeless
+// @version      1.5.2
+// @description  Trick Songsterr to unlock plus features. Fully bypasses SW errors and unlocks the UI.
+// @license      MIT
+// @supportURL   https://github.com/Strikeless/SongsterrPlusPatcher
+// @match        http*://*.songsterr.com/*
+// @run-at       document-start
+// @grant        unsafeWindow
+// @grant        GM.xmlHttpRequest
+// @contributor Darkil1
 // ==/UserScript==
 
 /*
 Copyright 2026, https://github.com/Strikeless
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the “Software”), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 */
 
 (function () {
     'use strict';
 
-    /// Common object accessible to both internal and injected functions.
     const common = {
         cfg: {
             enablePlusPatches: true,
@@ -54,12 +48,62 @@ THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR I
         return;
     }
 
-    // unsafeWindow refers to "the original window object of the webpage that allows reading or modifying global variables",
-    // which we must use if we want to modify things when running in a userscript manager with sandboxing (probably all the major ones?).
-    // https://violentmonkey.github.io/api/gm/#unsafewindow
     const win = unsafeWindow || window;
 
-    // Expose the common object globally so that it can be referred to as a parameter in hook function injects.
+    // --- PATCH 1: Destroy Service Worker ---
+    // SW causes crashes when '?demo=enabled' is present in requests
+    if ('serviceWorker' in win.navigator) {
+        win.navigator.serviceWorker.getRegistrations().then(function(registrations) {
+            for(let registration of registrations) {
+                registration.unregister();
+            }
+        }).catch(e => common.log("SW Unregister failed: " + e));
+
+        const origRegister = win.navigator.serviceWorker.register;
+        win.navigator.serviceWorker.register = function() {
+            common.log("Blocked Service Worker registration to prevent network errors.");
+            return Promise.reject(new Error("Blocked by SongsterrPlusPatcher"));
+        };
+    }
+
+    // --- PATCH 2: Hide '?demo=enabled' from URL ---
+    const cleanUrl = (url) => {
+        if (typeof url === 'string') {
+            return url.replace(/([?&])demo=(enabled|disabled)&?/g, (m, p1) => p1 === '?' ? '?' : '').replace(/[?&]$/, '');
+        } else if (url instanceof URL) {
+            return url.toString().replace(/([?&])demo=(enabled|disabled)&?/g, (m, p1) => p1 === '?' ? '?' : '').replace(/[?&]$/, '');
+        }
+        return url;
+    };
+
+    const origPushState = win.history.pushState;
+    win.history.pushState = function(state, title, url) {
+        return origPushState.call(this, state, title, cleanUrl(url));
+    };
+
+    const origReplaceState = win.history.replaceState;
+    win.history.replaceState = function(state, title, url) {
+        return origReplaceState.call(this, state, title, cleanUrl(url));
+    };
+
+    const origFetch = win.fetch;
+    win.fetch = async function(...args) {
+        if (args[0]) {
+            if (typeof args[0] === 'string' || args[0] instanceof URL) {
+                args[0] = cleanUrl(args[0]);
+            } else if (args[0] instanceof Request && args[0].url.includes('demo=')) {
+                args[0] = new Request(cleanUrl(args[0].url), args[0]);
+            }
+        }
+        return origFetch.apply(this, args);
+    };
+
+    const origOpen = win.XMLHttpRequest.prototype.open;
+    win.XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+        return origOpen.call(this, method, cleanUrl(url), ...rest);
+    };
+    // ------------------------------------------------------------------
+
     const commonObjectGlobalIdentifier = "_" + crypto.randomUUID().replaceAll("-", "");
     Object.defineProperty(
         win,
@@ -73,257 +117,171 @@ THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR I
     );
 
     const appClientEntryHook = async function (common) {
-        // NOTE: This function gets injected to appClient source with .toString(), so we don't have the script's lexical scope in here.
-
         common.log("Hello from patched appClient entry hook!");
 
         function patchStateData(state) {
-            /*
-            * Fake demo mode for plus features.
-            * This has become easier than faking a plus profile, which would now require nulling a signature check (with asymmetric keys) and a bunch of request spoofing.
-            */
-            state.demo = {
-                active: true,
-                enabled: true
-            };
-            state.query = {
-                demo: "enabled"
-            }
-            state.queryContent = {
-                demo: "enabled"
-            }
-            // This is a stupid hack to get plus controls in the UI. For some reason demo mode isn't enough here, so we must still be missing something on that front.
-            // This is 99% the first thing that will get this script patched because it's blatantly incorrect, but it'll do for now.
+            // We must keep demo mode active, otherwise the UI won't unlock the buttons
+            if (!state.demo) state.demo = {};
+            state.demo.active = true;
+            state.demo.enabled = true;
+            
+            if (!state.query) state.query = {};
+            state.query.demo = "enabled";
+            
+            if (!state.queryContent) state.queryContent = {};
+            state.queryContent.demo = "enabled";
+
+            if (!state.bonus) state.bonus = {};
             state.bonus.activatingPlus = true;
 
+            // Simulate a real subscription in the user profile
+            if (!state.user) state.user = {};
+            state.user.hasPlus = true;
+            if (!state.user.profile) state.user.profile = {};
+            state.user.profile.plan = "plus";
+            state.user.profile.sra_license = "active";
+            state.user.profile.sri_license = "active";
+            
             return state;
         }
+
         function applyStateDataPatch() {
             const stateJsonElement = document.getElementById("state");
-            const stateData = JSON.parse(stateJsonElement.innerHTML);
-            const stateDataPatched = patchStateData(stateData);
-            stateJsonElement.innerHTML = JSON.stringify(stateDataPatched);
+            if (stateJsonElement) {
+                try {
+                    const stateData = JSON.parse(stateJsonElement.innerHTML);
+                    stateJsonElement.innerHTML = JSON.stringify(patchStateData(stateData));
+                } catch(e) {}
+            }
+
+            // Patch the new server access snippet
+            const snapshotElement = document.getElementById("server-plus-access-snapshot");
+            if (snapshotElement) {
+                try {
+                    const snapshotData = JSON.parse(snapshotElement.innerHTML);
+                    snapshotData.hasPlus = true;
+                    snapshotData.permanentEditorBonus = true;
+                    snapshotElement.innerHTML = JSON.stringify(snapshotData);
+                } catch(e) {}
+            }
         }
 
         if (common.cfg.enablePlusPatches) {
             applyStateDataPatch();
-
-            // The app element has already been populated with buttons for free users, so remove this "stale" version.
-            // The site should create it again, now with (hopefully) fixed state.
             document.getElementById("app")?.remove();
         }
     };
 
     const appClientContextHook = async function (common, ctx, store) {
-        // NOTE: This function gets injected to appClient source with .toString(), so we don't have the script's lexical scope in here.
-
         common.log("Hello from patched appClient context hook!");
 
         function lateUiHook() {
-            common.log("Running late UI hook");
-
             if (common.cfg.enableLateFixes) {
-                // Remove ?demo=enabled from the URL (without reloading or ruining history though!), since the site may add that (given we are in demo mode).
                 const url = new URL(window.location.href);
                 if (url.searchParams.has("demo")) {
                     url.searchParams.delete("demo");
                     window.history.replaceState({}, "", url);
                 }
 
-                // Since the site thinks we're in demo mode, some links have ?demo=enabled appended to them (e.g. the mixer parts).
-                // We don't need that nor do we really want to confuse the server with demo mode when it disagrees.
                 const demoLinkElements = document.querySelectorAll("a[href*='?demo=']");
                 for (const demoLinkElement of demoLinkElements) {
-                    demoLinkElement.outerHTML = demoLinkElement.outerHTML
-                        .replaceAll("?demo=enabled", "")
-                        .replaceAll("?demo=disabled", "");
+                    demoLinkElement.href = demoLinkElement.href
+                        .replace(/([?&])demo=(enabled|disabled)&?/g, (m, p1) => p1 === '?' ? '?' : '')
+                        .replace(/[?&]$/, '');
                 }
 
                 const demoSongMarkerElement = document.querySelector("a[class*='_demo']");
                 demoSongMarkerElement?.remove();
-
-                /*
-                const topBarPlusButtonElement = document.querySelector("div:has(> #menu-plus)");
-                if (topBarPlusButtonElement != null) topBarPlusButtonElement.remove();
-                */
             }
         }
 
         const genuineStoreDispatchFunc = store.dispatch;
         function storeDispatchHook(eventIdentifier, ...eventDataArgs) {
-            if (common.cfg.debugSiteEvents != null && common.cfg.debugSiteEvents.test(eventIdentifier)) {
-                const stringifiedEventDataArgsObjectRefs = new WeakSet();
-                const stringifiedEventDataArgs = JSON.stringify(
-                    eventDataArgs,
-                    (_key, value) => {
-                        if (typeof value != "object" || value == null) return value;
-
-                        // Avoid stringifying repeats as a cheap way to prevent cyclic object values that would cause errors.
-                        if (stringifiedEventDataArgsObjectRefs.has(value)) return "<...>";
-                        stringifiedEventDataArgsObjectRefs.add(value);
-
-                        return value;
-                    }
-                );
-
-                common.log(`[DISPATCH DEBUG] "${eventIdentifier}": ${stringifiedEventDataArgs}`);
-            }
-
             switch (eventIdentifier) {
                 case "experiments/activate": {
                     const experimentName = eventDataArgs[0]?.experimentName;
-
                     if (experimentName == "plus_freeriders") {
                         common.broken("Experiment plus_freeriders was activated");
-                    } else if (common.cfg.cancelSiteExperiments) {
-                        common.log(`Rejecting experiment "${experimentName}" to deter script breakage. Please subscribe to Songsterr Plus if you want to experience their experimental features.`);
-                    } else {
-                        common.log(`Experiment "${experimentName}" was activated`);
                     }
-
                     return;
                 }
                 case "demo/deactivate": {
-                    common.broken("demo/deactivate event was dispatched");
-                    return;
+                    return; // Block deactivation of demo mode
                 }
                 case "@changed": {
                     const changedState = eventDataArgs[0];
-
-                    if (changedState.layer != null) {
-                        // Some layers have content that is dynamically added to the DOM. We'll have to rerun the late hook to apply any patches to those.
+                    if (changedState.layer != null || (changedState.runningThunks != null && Object.keys(changedState.runningThunks).length == 0)) {
                         setTimeout(lateUiHook, 50);
-                    } else if (changedState.runningThunks != null) {
-                        // This is javascriptism for a working "changedState.runningThunks == {}" by value.
-                        if (Object.keys(changedState.runningThunks).length == 0) {
-                            // All thunks finished running. We're using this as a trigger for when the whole tab viewer DOM has loaded.
-                            // This is even more stupid than the previous stupid, but somehow it's more reliable than the other things I tried...
-                            setTimeout(lateUiHook, 50);
-                        }
                     }
-
                     break;
                 }
                 default: {
-                    // I wish javascript had modern switch/match statements with pattern matching...
-                    if (eventIdentifier.startsWith("curiosity")) {
-                        if (common.cfg.cancelSiteEventCuriosity && eventIdentifier == "curiosity/event") return;
-                        if (common.cfg.cancelSiteOtherCuriosity) return;
-                    } else if (eventIdentifier.startsWith("promo")) {
-                        if (common.cfg.cancelSitePromo) return;
-                    }
-
+                    if (eventIdentifier.startsWith("curiosity") && common.cfg.cancelSiteOtherCuriosity) return;
+                    if (eventIdentifier.startsWith("promo") && common.cfg.cancelSitePromo) return;
                     break;
                 }
             }
-
             return genuineStoreDispatchFunc(eventIdentifier, ...eventDataArgs);
         }
-        Object.defineProperty(
-            store,
-            "dispatch",
-            { value: storeDispatchHook }
-        );
+        Object.defineProperty(store, "dispatch", { value: storeDispatchHook });
     };
 
     function fixRelocatedScriptRelatives(src, scriptOriginalSourceUrl) {
-        // Since a patched script isn't being loaded from it's original URL, we must resolve any relative javascript imports manually to the right URL.
-        src = src.replaceAll(
-            // I know I know, I should be burned alive for using regex to parse this. Don't really care all that much to be honest.
-            /["'`](\.+\/[^"'`]+.js)["'`]/g,
-            (match, capturedPath, ..._args) => {
-                const canonicalPath = new URL(capturedPath, scriptOriginalSourceUrl).href;
-                if (common.cfg.debugSourcePatcher) common.log(`Canonicalized relative script URL in patched script: ${capturedPath} -> ${canonicalPath}`);
-                return `"${canonicalPath}"`;
-            }
-        );
-
-        return src;
+        return src.replaceAll(/["'`](\.+\/[^"'`]+.js)["'`]/g, (match, capturedPath) => {
+            return `"${new URL(capturedPath, scriptOriginalSourceUrl).href}"`;
+        });
     }
 
     async function patchAppClientScriptSource(src, originalSourceUrl) {
-        /***** Plus patches *****/
         if (common.cfg.enablePlusPatches) {
-            // This is so stupid. We are patching hardcoded demo song id checks with this.
+            // Patch the demo song ID (27) taking into account different minification variants
             src = src
                 .replaceAll("===27", "===27 || true")
                 .replaceAll("!==27", "!==27 && false")
+                .replaceAll("=== 27", "=== 27 || true")
+                .replaceAll("!== 27", "!== 27 && false")
                 .replace(/\w+\(window\.location\.pathname\)/g, '27');
         }
 
-        /***** Hook injections for running code in the context of this script *****/
-        // Inject our entry hook as the very first thing in the script.
-        src = `
-            await ( ${appClientEntryHook.toString()} )(window.${commonObjectGlobalIdentifier});
-            ${src}
-        `;
+        src = `await (${appClientEntryHook.toString()})(window.${commonObjectGlobalIdentifier});\n${src}`;
 
-        /*
-         * Inject our context hook after the context object is created in the initializer function.
-         * On second thought, maybe they actually should burn me alive for writing these regexes. Jesus fucking christ.
-         * The proper way to do this would be to parse the script to an AST, make our modifications using that, and then reconstruct the script from the AST. Don't use these regexes as an example, please.
-         * Regex isn't thaaat bad, right?
-         */
-        const ctxStoreDefinitionMatch = src.match(
-            /(\w+)=(\w+)\.get\(\w+\.Store\)[^;]*;/
-        );
-        if (ctxStoreDefinitionMatch == null) {
-            common.broken("Didn't find context/store variables");
-            return src;
+        const ctxStoreDefinitionMatch = src.match(/(\w+)=(\w+)\.get\(\w+\.Store\)[^;]*;/);
+        if (ctxStoreDefinitionMatch) {
+            const [ctxStoreDefinition, storeVariableIdentifier, ctxVariableIdentifier] = ctxStoreDefinitionMatch;
+            const contextHook = `await (${appClientContextHook.toString()})(window.${commonObjectGlobalIdentifier}, ${ctxVariableIdentifier}, ${storeVariableIdentifier});`;
+            src = src.replace(ctxStoreDefinition, `${ctxStoreDefinition}${contextHook}`);
         }
-        const [ctxStoreDefinition, storeVariableIdentifier, ctxVariableIdentifier] = ctxStoreDefinitionMatch;
-
-        const contextHook = `await (${ appClientContextHook.toString() })(
-            window.${commonObjectGlobalIdentifier},
-            ${ctxVariableIdentifier},
-            ${storeVariableIdentifier}
-        );`;
-        src = src.replace(ctxStoreDefinition, `${ctxStoreDefinition}${contextHook}`);
 
         return src;
     }
+
     function patchAndDivertAppClient() {
         const appClientElement = document.querySelector("script[src*='appClient']");
         const appClientSrcUrl = appClientElement?.src;
+        if(!appClientSrcUrl) return;
+
         common.log("Fetching appClient from: " + appClientSrcUrl);
 
         GM.xmlHttpRequest({
             url: appClientSrcUrl,
             anonymous: true,
             onload: async scriptSourceResponse => {
-                if ((scriptSourceResponse.status < 200 || scriptSourceResponse.status > 299) && (scriptSourceResponse.status < 500 || scriptSourceResponse.status > 599)) {
-                    common.broken("appClient fetch responded with status " + scriptSourceResponse.status);
-                }
-
                 const scriptSource = scriptSourceResponse.responseText;
                 const scriptSourceFixed = fixRelocatedScriptRelatives(scriptSource, appClientSrcUrl);
                 const scriptSourcePatched = await patchAppClientScriptSource(scriptSourceFixed, appClientSrcUrl);
 
-                /*
-                Alternative method which seems to have some problems. Didn't bother looking more into it, as the method below is sure to work.
-                const patchedAppClientObjectUrl = URL.createObjectURL(new Blob([sourcePatched], { type: "text/javascript" }));
-                await import(patchedAppClientObjectUrl);
-                URL.revokeObjectURL(patchedAppClientObjectUrl);
-                common.log("Patched appClient exited")
-                */
                 let patchedScriptElement = document.createElement("script");
                 patchedScriptElement.async = true;
                 patchedScriptElement.type = "module";
                 patchedScriptElement.crossOrigin = "anonymous";
                 patchedScriptElement.textContent = scriptSourcePatched;
                 document.body.appendChild(patchedScriptElement);
-            },
-            onerror: err => {
-                common.log("Error fetching appClient: " + err);
             }
         });
 
-        // We'll continue in the async world of xmlHttpRequest's onload. In this scope, we're done, and should prevent anything more from executing.
         throw new Error("Stopping execution of original script prematurely. THIS IS INTENTIONAL BEHAVIOR, YOU MAY DISREGARD.");
     }
 
-    // The site's appClient script reads __APP_INITIALIZED very early on (before it has read state or anything like that).
-    // Hook a getter in front of that variable, where we will run our early patching code, before appClient gets a chance to do anything meaningful.
     let appInitializedValue = null;
     let appClientPatched = false;
     Object.defineProperty(
@@ -334,9 +292,7 @@ THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR I
                 if (!appClientPatched) {
                     appClientPatched = true;
                     patchAndDivertAppClient();
-                    // unreachable();
                 }
-
                 return appInitializedValue;
             },
             set(value) {
